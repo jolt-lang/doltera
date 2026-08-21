@@ -70,12 +70,13 @@ genuinely binary.
 - `(dolt-status conn)` / `(dolt-log conn)` — Dolt 2.x table functions
 
 `doltera.protocol` exposes the raw protocol layer (`open-conn`, `handshake!`,
-`query-text`, `prepare-stmt`, `execute-stmt`, ...) for lower-level use.
+`query-text`, `prepare-stmt`, `execute-stmt`, `clear-stmt-cache!`, ...) for
+lower-level use.
 
 ## Tests
 
 The wire-protocol checks run against captured packets and need no server. The
-rest spawn a fresh `dolt sql-server` on a free port against a temp repo — 55
+rest spawn a fresh `dolt sql-server` on a free port against a temp repo — 63
 checks in total. Set `DOLTERA_TEST_PORT`, `DOLTERA_TEST_DB` and optionally
 `DOLTERA_TEST_DATA_DIR` to run against an already-running server instead; the
 suite creates its own tables, so point it at an empty database.
@@ -91,6 +92,10 @@ jolt -M:test
   dolt denies rather than asking the client to switch plugins. A server that
   does ask gets a clear error naming the plugin.
 - The connection asks for `utf8mb4`, and decodes every result as UTF-8.
+- Each connection prepares a statement once and reuses it, which roughly halves
+  the cost of a repeated query. The cache holds 64 statements and evicts the
+  least recently used; `select-db!` clears it, since SQL text only picks out the
+  same statement within one database.
 - `use` is not accepted as a prepared statement, so `select-db!` (for switching
   databases mid-connection) goes through the text protocol.
 - `dolt_commit` needs `-A` (stage all, incl. new tables) or an explicit

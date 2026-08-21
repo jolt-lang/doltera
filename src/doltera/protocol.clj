@@ -1,6 +1,7 @@
 (ns doltera.protocol
   "MySQL wire protocol client (text + binary result sets) for dolt sql-server.
-  One connection, sequential commands, no pipelining. Auth is
+  One connection, sequential commands, no pipelining — which is also what lets
+  each connection keep a cache of its prepared statements. Auth is
   mysql_native_password (SHA-1 scramble), which dolt's default users use."
   (:require [jolt.socket]
             [jolt.ffi :as ffi]
@@ -15,7 +16,8 @@
     {:socket s
      :in (.getInputStream s)
      :out (.getOutputStream s)
-     :seq (atom 0)}))
+     :seq (atom 0)
+     :stmts (atom {:tick 0 :entries {}})}))
 
 (defn close-conn [conn]
   (.close (:socket conn)))
@@ -180,6 +182,8 @@
           :else (throw (ex-info "unexpected auth response"
                                 {:type :mysql/auth :first f})))))))
 
+(declare clear-stmt-cache!) ; defined with the statement cache, below
+
 (defn select-db!
   "Switch the working database/repo with `use`. Connecting with :db selects one
   through the handshake; this is for switching afterwards."
@@ -190,7 +194,11 @@
         f (w/u8 b 0)]
     (if (= f 0xff)
       (parse-err! b)
-      (assoc conn :db db))))
+      (do
+        ;; the cache is keyed by SQL text, which no longer picks out the same
+        ;; statement once the database underneath it changes
+        (clear-stmt-cache! conn)
+        (assoc conn :db db)))))
 
 ;; -- columns and rows ------------------------------------------------------------
 
@@ -432,9 +440,83 @@
 (defn close-stmt [conn stmt-id]
   (send-command conn 0x19 (w/w32 stmt-id)))
 
-(defn query-prepared [conn sql params]
-  (let [prep (prepare-stmt conn sql)]
-    (try
-      (execute-stmt conn prep params)
-      (finally
-        (try (close-stmt conn (:stmt-id prep)) (catch Throwable _ nil))))))
+
+;; -- prepared statement cache ----------------------------------------------------
+
+(def ^:private max-cached-stmts
+  "Prepared statements kept open per connection. The server has its own ceiling
+  (max_prepared_stmt_count, 16382 on dolt); this one bounds a caller that builds
+  a fresh SQL string for every query."
+  64)
+
+(def ^:private unknown-stmt-errors
+  "What a server answers with when asked to execute a handle it doesn't have:
+  2014 from dolt, 1243 (ER_UNKNOWN_STMT_HANDLER) from MySQL."
+  #{1243 2014})
+
+(def ^:private evict-batch
+  "How many statements to drop when the cache overflows. Evicting a batch means
+  ranking the entries once every evict-batch inserts instead of hunting for a
+  single victim on each one, which matters for a caller whose SQL is never the
+  same twice and so always misses."
+  16)
+
+(defn- lru-sqls [entries]
+  (map key (take evict-batch (sort-by #(:used (val %)) entries))))
+
+(defn- cache-hit!
+  "The statement already prepared for sql, marked as just used."
+  [conn sql]
+  (let [{:keys [tick entries]} @(:stmts conn)]
+    (when-let [e (get entries sql)]
+      (reset! (:stmts conn)
+              {:tick (inc tick) :entries (assoc entries sql (assoc e :used (inc tick)))})
+      (:stmt e))))
+
+(defn- cache-put!
+  "Remember stmt for sql, closing the least recently used statements if that
+  puts the cache over its bound."
+  [conn sql stmt]
+  (let [{:keys [tick entries]} @(:stmts conn)
+        t (inc tick)
+        entries (assoc entries sql {:stmt stmt :used t})
+        evict (when (> (count entries) max-cached-stmts) (lru-sqls entries))]
+    (reset! (:stmts conn) {:tick t :entries (apply dissoc entries evict)})
+    (doseq [victim evict]
+      (close-stmt conn (:stmt-id (:stmt (get entries victim)))))))
+
+(defn- cache-forget! [conn sql]
+  (swap! (:stmts conn) update :entries dissoc sql))
+
+(defn clear-stmt-cache!
+  "Close every statement cached on this connection and empty the cache."
+  [conn]
+  (let [entries (:entries @(:stmts conn))]
+    (reset! (:stmts conn) {:tick 0 :entries {}})
+    (doseq [e (vals entries)]
+      (try (close-stmt conn (:stmt-id (:stmt e))) (catch Throwable _ nil)))))
+
+(defn cached-stmt
+  "Prepare sql on this connection, or hand back the statement already prepared
+  for it. Dolt resolves a prepared statement against the current schema on every
+  execute, so a cached one survives DDL against the tables it reads."
+  [conn sql]
+  (or (cache-hit! conn sql)
+      (let [stmt (prepare-stmt conn sql)]
+        (cache-put! conn sql stmt)
+        stmt)))
+
+(defn query-prepared
+  "Run sql with params over the binary protocol, reusing the statement already
+  prepared for it on this connection. Preparing is about as expensive as
+  executing, so reuse roughly halves the cost of a repeated query."
+  [conn sql params]
+  (try
+    (execute-stmt conn (cached-stmt conn sql) params)
+    (catch Exception e
+      ;; the server no longer has the handle — closed behind our back, or
+      ;; dropped on its side. Prepare it again and run once more.
+      (if (contains? unknown-stmt-errors (:code (ex-data e)))
+        (do (cache-forget! conn sql)
+            (execute-stmt conn (cached-stmt conn sql) params))
+        (throw e)))))

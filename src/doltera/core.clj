@@ -5,7 +5,8 @@
   rest are `?` parameters). Prepared statements are used for everything, so
   values come back typed: integers as longs, floats as doubles, NULL as nil,
   strings as strings, blobs as byte arrays. DECIMAL and date/time values come
-  back as strings.
+  back as strings. A statement is prepared once per connection and reused, so
+  running the same SQL in a loop costs one round trip instead of three.
 
   Dolt's version-control procedures (dolt_commit, dolt_branch, dolt_log, ...)
   are reachable through `query` with `call dolt_commit(...)`, and a few common

@@ -51,6 +51,12 @@
     (proto/write-packet {:out out :seq (atom 0)} payload)
     (.toByteArray out)))
 
+(defn cached-stmt [conn sql]
+  (get-in @(:stmts conn) [:entries sql :stmt]))
+
+(defn cache-size [conn]
+  (count (:entries @(:stmts conn))))
+
 (defn err-message [payload]
   (try (proto/parse-err! payload) :no-throw
        (catch Exception e (:message (ex-data e)))))
@@ -179,6 +185,41 @@
          (dolt/fetch-one conn "select * from person where id = 2"))
   (check "sql error throws" :caught
          (try (dolt/query conn "select * from missing_table") (catch Exception _ :caught)))
+
+  (println "  --- prepared statement cache")
+  (let [sql "select 7 as cached"]
+    (dolt/query conn sql)
+    (let [first-id (:stmt-id (cached-stmt conn sql))]
+      (dotimes [_ 4] (dolt/query conn sql))
+      (check "a repeated query reuses one prepared statement" first-id
+             (:stmt-id (cached-stmt conn sql)))
+      (check "the reused statement still returns rows" [{:cached 7}] (dolt/query conn sql))))
+  (let [before (cache-size conn)]
+    (doseq [sql ["select 1 as one" "select 2 as two" "select 3 as three"]]
+      (dolt/query conn sql)
+      (dolt/query conn sql))
+    (check "one cache entry per distinct statement" (+ before 3) (cache-size conn)))
+  (let [victim-sql "select 'evictable' as v"
+        _ (dolt/query conn victim-sql)
+        victim (cached-stmt conn victim-sql)]
+    (dotimes [i 70] (dolt/query conn (str "select " i " as filler")))
+    (check "the cache stays within its bound" true (<= (cache-size conn) 64))
+    (check "an evicted statement is closed on the server" :gone
+           (try (proto/execute-stmt conn victim []) :still-open
+                (catch Exception e (if (= 2014 (:code (ex-data e))) :gone :other)))))
+  (let [sql "select 42 as recovered"]
+    (dolt/query conn sql)
+    (proto/close-stmt conn (:stmt-id (cached-stmt conn sql)))
+    (check "a query recovers when the server forgot its statement" [{:recovered 42}]
+           (dolt/query conn sql)))
+  (dolt/execute! conn "create table evolving (id int primary key)")
+  (dolt/execute! conn "insert into evolving values (1)")
+  (dolt/query conn "select * from evolving")
+  (dolt/execute! conn "alter table evolving add column extra int default 7")
+  (check "a cached statement picks up a schema change" [{:id 1 :extra 7}]
+         (dolt/query conn "select * from evolving"))
+  (proto/select-db! conn (:db opts))
+  (check "switching database clears the cache" 0 (cache-size conn))
 
   (println "  --- auth")
   (dolt/execute! conn "drop user if exists 'doltera_pw'@'%'")
