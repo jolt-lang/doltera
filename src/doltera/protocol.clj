@@ -239,21 +239,21 @@
 (defn- bytes->double [b off]
   (let [p (ffi/alloc 8)]
     (try
-      (dotimes [i 8] (ffi/write p :uint8 i (w/u8 b (+ off i))))
+      (dotimes [i 8] (ffi/write p :uint8 (w/u8 b (+ off i)) i))
       (ffi/read p :double 0)
       (finally (ffi/free p)))))
 
 (defn- bytes->float [b off]
   (let [p (ffi/alloc 4)]
     (try
-      (dotimes [i 4] (ffi/write p :uint8 i (w/u8 b (+ off i))))
+      (dotimes [i 4] (ffi/write p :uint8 (w/u8 b (+ off i)) i))
       (ffi/read p :float 0)
       (finally (ffi/free p)))))
 
 (defn- bytes-of-double [v]
   (let [p (ffi/alloc 8)]
     (try
-      (ffi/write p :double 0 v)
+      (ffi/write p :double v 0)
       (byte-array (mapv #(ffi/read p :uint8 %) (range 8)))
       (finally (ffi/free p)))))
 
